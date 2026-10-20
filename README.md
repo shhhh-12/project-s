@@ -41,3 +41,4 @@ Add its complete anchored rubric JSON, source Markdown and tests, then flip the 
 ## Stage 2
 
 Key proxy, Tamil golden-set/eval runner, B2B rubrics, provider-side diarization (`provider.options`), two-channel recordings, roleplay.
+"# project-s" 
