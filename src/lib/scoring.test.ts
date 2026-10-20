@@ -1,0 +1,11 @@
+import { describe, expect, it } from 'vitest'; import { scoreCall } from './scoring'; import { criterionIds, type Criterion } from '../domain';
+const make=(scores:Array<number|null>):Criterion[]=>criterionIds.map((id,i)=>({id,score:scores[i],reasoning:'x',evidence:[],verified:true}));
+describe('scoreCall',()=>{it('scores a full card as 100',()=>expect(scoreCall(make([3,3,3,3,3,3,3,3])).total).toBe(100));it('renormalizes N/A',()=>expect(scoreCall(make([2,2,2,2,2,null,2,2])).total).toBe(66.7));it('caps a red flag',()=>{const r=scoreCall(make([3,3,3,3,3,3,3,3]),1);expect(r.total).toBe(50);expect(r.compliance_status).toBe('FAIL')});it('returns an unscored result when no verified criteria apply',()=>expect(scoreCall(make([null,null,null,null,null,null,null,null])).band).toBe('Unscored'))});
+describe('scoreCall v2',()=>{
+  it('single criterion is Insufficient evidence',()=>{const r=scoreCall(make([3,null,null,null,null,null,null,null]));expect(r.band).toBe('Insufficient evidence');expect(r.provisional).toBe(true);expect(r.coverage).toBeLessThan(0.6)});
+  it('full card is unchanged',()=>{const r=scoreCall(make([3,3,3,3,3,3,3,3]));expect(r).toMatchObject({total:100,raw:100,band:'Excellent',coverage:1,provisional:false,gate:{failed:false}})});
+  it('gate reason populated',()=>{const r=scoreCall(make([3,3,3,3,3,3,3,3]),1,{redFlagReasons:['Guaranteed returns']});expect(r.gate).toEqual({failed:true,reason:'Guaranteed returns'});expect(r.total).toBe(50);const z=scoreCall(make([3,3,3,3,3,3,3,0]));expect(z.gate.failed).toBe(true);expect(z.total).toBeLessThanOrEqual(50)});
+  it('compliance null is not failed',()=>{const r=scoreCall(make([3,3,3,3,3,3,3,null]));expect(r.gate).toEqual({failed:false,reason:'Compliance not assessed'});expect(r.total).toBe(100)});
+  it('unverified compliance 0 is not assessed, not failed',()=>{const c=make([3,3,3,3,3,3,3,0]).map(x=>x.id==='compliance'?{...x,verified:false}:x);const r=scoreCall(c);expect(r.gate).toEqual({failed:false,reason:'Compliance not assessed'});expect(r.compliance_status).toBe('PASS')});
+  it('unknown id does not throw',()=>{const c=[...make([3,3,3,3,3,3,3,3]),{id:'bogus',score:3,reasoning:'x',evidence:[],verified:true} as unknown as Criterion];expect(()=>scoreCall(c)).not.toThrow();expect(scoreCall(c).total).toBe(100)});
+});

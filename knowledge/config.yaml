@@ -1,0 +1,12 @@
+version: 1.0
+segments:
+  b2c: enabled
+  b2b: disabled
+call_types:
+  inbound_lead: enabled
+  outbound_cold: disabled
+  discovery_b2b: disabled
+  demo: disabled
+  negotiation_closing: disabled
+  follow_up: disabled
+  renewal_upsell: disabled
