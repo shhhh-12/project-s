@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { RouterModel } from '../config/models';
+import { supportsNativeDiarization } from '../config/models';
 
 const base = 'https://openrouter.ai/api/v1';
 
@@ -267,6 +268,41 @@ async function directChatJson<T>(key: string, model: string, system: string, use
 /** What OpenRouter reported for one chat call (cost is in USD when the provider reports it). */
 export type Usage = { prompt_tokens?: number | null; completion_tokens?: number | null; total_tokens?: number | null; cost?: number | null } | null | undefined;
 export type TranscribeUsage = { generationId?: string; cost?: number | null };
+export type TranscriptSegment = { text: string; start: number; end: number; speaker: string };
+export type TranscribeOptions = {
+  language?: string;
+  signal?: AbortSignal;
+  onUsage?: (usage: TranscribeUsage) => void;
+  /** Use a model's native diarization when it is documented to support it. */
+  diarize?: boolean;
+  onSegments?: (segments: TranscriptSegment[]) => void;
+};
+
+/** Converts provider-specific verbose transcription output into stable speaker-labelled turns. */
+export function nativeSegments(model: string, value: unknown): TranscriptSegment[] {
+  if (!value || typeof value !== 'object') return [];
+  const response = value as { segments?: unknown; words?: unknown };
+  const items = model === 'elevenlabs/scribe-v2' && Array.isArray(response.words) ? response.words : response.segments;
+  if (!Array.isArray(items)) return [];
+  const words = items.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const part = item as Record<string, unknown>;
+    const text = typeof part.word === 'string' ? part.word : typeof part.text === 'string' ? part.text : '';
+    const start = typeof part.start === 'number' ? part.start : NaN;
+    const end = typeof part.end === 'number' ? part.end : NaN;
+    const speaker = part.speaker_label ?? part.speaker;
+    return text && Number.isFinite(start) && Number.isFinite(end) && speaker != null ? [{ text, start, end, speaker: String(speaker) }] : [];
+  });
+  // ElevenLabs returns one word at a time; grouping preserves its speaker boundaries while keeping the UI practical.
+  return words.reduce<TranscriptSegment[]>((out, word) => {
+    const previous = out[out.length - 1];
+    if (previous && previous.speaker === word.speaker) {
+      previous.text += `${/^[,.;:!?)]/.test(word.text) ? '' : ' '}${word.text}`;
+      previous.end = word.end;
+    } else out.push({ ...word });
+    return out;
+  }, []);
+}
 
 const wait = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
@@ -281,22 +317,37 @@ export async function transcribe(
   key: string,
   model: string,
   audio: { data: string; format: string },
-  options: { language?: string; signal?: AbortSignal; onUsage?: (usage: TranscribeUsage) => void } = {},
+  options: TranscribeOptions = {},
 ) {
   if (await routedThroughProxy()) {
     const { proxyTranscribe } = await import('./proxy');
     return proxyTranscribe(key, model, audio, options);
   }
+  const nativeDiarization = Boolean(options.diarize && supportsNativeDiarization(model));
   const body = JSON.stringify({
     model,
     input_audio: { data: audio.data, format: audio.format },
     ...(options.language ? { language: options.language } : {}),
+    ...(nativeDiarization && model === 'microsoft/mai-transcribe-2'
+      ? {
+          response_format: 'verbose_json',
+          timestamp_granularities: ['word'],
+          provider: { options: { azure: { diarization: { enabled: true } } } },
+        }
+      : nativeDiarization
+        ? {
+            response_format: 'verbose_json',
+            timestamp_granularities: ['word'],
+            provider: { options: { elevenlabs: { diarize: true, num_speakers: 2, tag_audio_events: false } } },
+          }
+        : {}),
   });
   for (let attempt = 0; ; attempt++) {
     try {
       const response = await request(`${base}/audio/transcriptions`, { method: 'POST', headers: headers(key), body }, options.signal);
-      const out = (await response.json()) as { text?: unknown; usage?: { cost?: unknown } };
+      const out = (await response.json()) as { text?: unknown; usage?: { cost?: unknown }; segments?: unknown; words?: unknown };
       if (typeof out.text !== 'string') throw new RouterError(502, 'The transcription model returned no text.');
+      if (nativeDiarization) options.onSegments?.(nativeSegments(model, out));
       options.onUsage?.({
         generationId: response.headers?.get?.('x-generation-id') ?? undefined,
         cost: typeof out.usage?.cost === 'number' ? out.usage.cost : null,

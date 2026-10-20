@@ -126,4 +126,5 @@ mark.hl-evidence{background:#12e8e020;text-decoration:none;box-shadow:inset 0 -2
 
 /* Direct key / Team server switch in Settings */
 .seg.compact{margin:12px 0 4px}
+.modelPresets{display:grid;gap:8px;margin:12px 0 4px}.modelPresets button{display:grid;gap:3px;text-align:left;border:1px solid #34414c;background:#101419;color:#edf5f6;border-radius:8px;padding:12px 13px}.modelPresets button:hover{border-color:#12e8e0;background:#111d21}.modelPresets button.active{border-color:#12e8e0;background:#082529;box-shadow:inset 3px 0 #12e8e0}.modelPresets small{color:#98a4b3;font-weight:500}.modelPresets button.active small{color:#b7c2cb}
 .privacy .text{display:inline;margin:0;padding:0 2px;background:none;border:0;color:#12e8e0;text-decoration:underline;cursor:pointer;font:inherit}

@@ -34,6 +34,35 @@ Return ONLY JSON: {"labels":[{"i":1,"speaker":"rep"},{"i":2,"speaker":"customer"
 
 export type DiarizedTurn = { speaker: Speaker; text: string };
 
+const roleSchema = z.object({ roles: z.array(z.object({ label: z.string(), speaker: z.unknown().transform(speakerOf) })) });
+const roleSystem = `You map anonymous speaker labels in an inbound sales call to roles. The sales rep represents the business; the customer is enquiring about or buying a product. Read the short samples for each label and decide whether it is the rep or customer. Return ONLY JSON: {"roles":[{"label":"Speaker 1","speaker":"rep"}]}. Use "unknown" only when the samples cannot establish a role.`;
+
+/** Maps provider diarization labels to call roles in one small request, avoiding a slower label-per-sentence pass. */
+export async function mapNativeSpeakerRoles(
+  key: string,
+  model: string,
+  turns: Array<{ name: string; text: string }>,
+  options: { signal?: AbortSignal; onUsage?: (usage: Usage) => void } = {},
+): Promise<Map<string, Speaker> | undefined> {
+  const samples = new Map<string, string[]>();
+  for (const turn of turns) {
+    const list = samples.get(turn.name) ?? [];
+    if (list.length < 3) list.push(turn.text.slice(0, 300));
+    samples.set(turn.name, list);
+  }
+  if (samples.size < 2) return undefined;
+  const user = [...samples].map(([label, lines]) => `${label}: ${lines.join(' / ')}`).join('\n');
+  try {
+    const { data, usage } = await chatJson(key, model, roleSystem, user, roleSchema, options.signal, 800);
+    options.onUsage?.(usage);
+    const roles = new Map(data.roles.map((role) => [role.label, role.speaker]));
+    return [...samples.keys()].every((label) => roles.has(label) && roles.get(label) !== 'unknown') ? roles : undefined;
+  } catch (error) {
+    if (error instanceof RouterError && error.status === 502) return undefined;
+    throw error;
+  }
+}
+
 const SEGMENT_MAX = 240;
 
 /** Splits text into sentence-sized segments without changing any word. Over-long sentences are cut at commas, then by word count. */

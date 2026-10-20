@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { chatJson, DEFAULT_MAX_TOKENS, extractJson, listModels, RouterError, transcribe, validateKey } from './openrouter';
+import { chatJson, DEFAULT_MAX_TOKENS, extractJson, listModels, nativeSegments, RouterError, transcribe, validateKey } from './openrouter';
 
 const original = globalThis.fetch;
 afterEach(() => {
@@ -40,6 +40,36 @@ describe('openrouter client', () => {
     expect('language' in (calls[0].body ?? {})).toBe(false);
     expect(calls[1].body?.language).toBe('ta');
     expect(calls[1].body?.input_audio).toEqual({ data: 'AAA', format: 'wav' });
+  });
+  it('asks Scribe v2 for native diarization and converts labelled words into turns', async () => {
+    const calls = mock(() => ({ json: {
+      text: 'Vanakkam sir hello',
+      words: [
+        { word: 'Vanakkam', start: 0, end: 0.4, speaker_label: 'speaker_0' },
+        { word: 'sir', start: 0.4, end: 0.6, speaker_label: 'speaker_0' },
+        { word: 'hello', start: 0.7, end: 1, speaker_label: 'speaker_1' },
+      ],
+    } }));
+    const segments: unknown[] = [];
+    await transcribe('k', 'elevenlabs/scribe-v2', { data: 'AAA', format: 'wav' }, { diarize: true, onSegments: (items) => segments.push(...items) });
+    expect(calls[0].body).toMatchObject({
+      response_format: 'verbose_json',
+      provider: { options: { elevenlabs: { diarize: true, num_speakers: 2 } } },
+    });
+    expect(segments).toEqual([
+      { text: 'Vanakkam sir', start: 0, end: 0.6, speaker: 'speaker_0' },
+      { text: 'hello', start: 0.7, end: 1, speaker: 'speaker_1' },
+    ]);
+  });
+  it('normalizes Scribe punctuation while preserving speaker boundaries', () => {
+    expect(nativeSegments('elevenlabs/scribe-v2', { words: [
+      { word: 'Apadi', start: 0, end: 0.2, speaker: 0 },
+      { word: 'thana?', start: 0.2, end: 0.5, speaker: 0 },
+      { word: 'Yes.', start: 0.6, end: 0.9, speaker: 1 },
+    ] })).toEqual([
+      { text: 'Apadi thana?', start: 0, end: 0.5, speaker: '0' },
+      { text: 'Yes.', start: 0.6, end: 0.9, speaker: '1' },
+    ]);
   });
   it('extracts JSON from fenced or chatty answers', () => {
     expect(extractJson('```json\n{"a":1}\n```')).toEqual({ a: 1 });

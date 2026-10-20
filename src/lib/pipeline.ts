@@ -1,14 +1,14 @@
 import { z } from 'zod';
 import { AnalysisSchema, SEVERITIES, criterionIds, type Analysis, type CostItem, type Criterion, type CriterionId } from '../domain';
 import { RUBRIC } from '../config/rubric';
-import type { ModelSlots } from '../config/models';
+import { supportsNativeDiarization, type ModelSlots } from '../config/models';
 import { systemPrompt, PROMPT_VERSION } from '../prompts/analysis';
 import { prepareAudio, type PreparedAudio } from './audio';
 import { chatCostItem, transcribeCostItem } from './cost';
 import { scoreCall } from './scoring';
-import { diarize, speakerOf } from './diarize';
-import { chatJson, transcribe, type TranscribeUsage } from './openrouter';
-import { hasTamilScript, romanizeTamilText } from './romanize';
+import { diarize, mapNativeSpeakerRoles, speakerOf } from './diarize';
+import { chatJson, transcribe, type TranscriptSegment, type TranscribeUsage } from './openrouter';
+import { applyTanglishDictionary, hasTamilScript, romanizeTamilText } from './romanize';
 import { computeAllMetrics } from './metrics';
 import { turnForTimestamp } from './mistakes';
 import { bytesHash, getReport, getTranscript, setReport, setTranscript, textHash } from './cache';
@@ -206,6 +206,7 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
   let source = pasted.trim();
   let windows: TimeWindow[] | undefined;
   let audioDuration = 0;
+  let nativeSpeakerSegments: TranscriptSegment[] = [];
   const costs: CostItem[] = [];
   const speechCalls: Array<{ label: string; seconds: number; usage: TranscribeUsage }> = [];
   const timings: Record<string, number> = {};
@@ -233,6 +234,7 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
       parts = cached.pieces;
       source = parts.join(' ');
       audioDuration = cached.seconds.reduce((sum, s) => sum + s, 0);
+      nativeSpeakerSegments = cached.nativeSpeakerSegments ?? [];
       let cursor = 0;
       windows = parts.map((piece, i) => {
         const span = cached.seconds[i] ?? 60;
@@ -246,24 +248,33 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
       const prepared = await timed('prepare', 'prepare', () => (deps?.prepareAudio ?? prepareAudio)(audio, signal));
       audioDuration = prepared.duration;
 
-      // Transcribe chunks in parallel (3 at a time) for speed
+      // Transcribe chunks in parallel. Native diarization eliminates the much slower sentence-by-sentence pass later.
       const transcribeStarted = performance.now();
-      const transcribed = await mapWithLimit(prepared.chunks, 3, async (chunk, i) => {
+      const useNativeDiarization = supportsNativeDiarization(models.transcribe);
+      const transcribed = await mapWithLimit(prepared.chunks, 4, async (chunk, i) => {
         if (signal?.aborted) throw aborted();
         const partLabel = prepared.chunks.length > 1 ? `part ${i + 1} of ${prepared.chunks.length}` : 'full call';
         const usage: TranscribeUsage = {};
-        const piece = (await transcribe(key, models.transcribe, chunk, { language, signal, onUsage: (u) => Object.assign(usage, u) })).trim();
+        let segments: TranscriptSegment[] = [];
+        const piece = (await transcribe(key, models.transcribe, chunk, {
+          language,
+          signal,
+          diarize: useNativeDiarization,
+          onUsage: (u) => Object.assign(usage, u),
+          onSegments: (items) => { segments = items.map((item) => ({ ...item, start: item.start + chunk.start, end: item.end + chunk.start })); },
+        })).trim();
         const span = chunk.end > chunk.start ? chunk.end - chunk.start : prepared.duration;
-        return { chunk, partLabel, piece, span, usage };
+        return { chunk, partLabel, piece, span, usage, segments };
       });
       const nonEmpty = transcribed.filter(({ piece }) => Boolean(piece));
       parts = nonEmpty.map(({ piece }) => piece);
       const seconds = nonEmpty.map(({ span }) => span);
+      nativeSpeakerSegments = nonEmpty.flatMap(({ segments }) => segments);
       windows = nonEmpty.map(({ chunk, piece }) => ({ chars: piece.length + 1, start: chunk.start, end: chunk.end }));
       speechCalls.push(...transcribed.map(({ partLabel, span, usage }) => ({ label: `Transcription · ${partLabel}`, seconds: span, usage })));
       onProgress('transcribe', `Transcribed ${prepared.chunks.length} part${prepared.chunks.length > 1 ? 's' : ''}`);
       timings['transcribe'] = Math.round(performance.now() - transcribeStarted);
-      if (audioHash) await setTranscript(audioHash, models.transcribe, language, { pieces: parts, seconds }).catch(() => undefined);
+      if (audioHash) await setTranscript(audioHash, models.transcribe, language, { pieces: parts, seconds, nativeSpeakerSegments }).catch(() => undefined);
     }
 
     if (!parts.some(Boolean)) throw new Error('No speech could be transcribed from this recording. Check the file, or try a different transcription model.');
@@ -276,15 +287,35 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
   // Runs for every input (audio or pasted) so no Tamil letters reach the transcript, the scoring model or the metrics.
   // The model converts distinct words; anything it skips or mangles is converted by built-in rules instead.
   const prepModel = models.prep?.trim() || models.understand;
-  if (hasTamilScript(source)) {
-    onProgress('romanize', 'Converting Tamil words to Tanglish');
-    const converted = await timed('romanize', 'romanize', () =>
-      romanizeTamilText(key, prepModel, source, {
+  const nativeTurns = nativeSpeakerSegments.reduce<Array<{ name: string; text: string; start: number; end: number }>>((out, segment) => {
+    const previous = out[out.length - 1];
+    if (previous && previous.name === segment.speaker) {
+      previous.text += ` ${segment.text}`;
+      previous.end = segment.end;
+    } else out.push({ name: segment.speaker, text: segment.text, start: segment.start, end: segment.end });
+    return out;
+  }, []);
+  const canUseNativeTurns = nativeTurns.length > 0 && new Set(nativeTurns.map((turn) => turn.name)).size > 1;
+  const romanization = hasTamilScript(source)
+    ? timed('romanize', 'romanize', () => romanizeTamilText(key, prepModel, source, {
+      signal,
+      onProgress: (detail) => onProgress('romanize', detail),
+      onUsage: (u, { part, parts }) => costs.push(chatCostItem('thanglish', `Tanglish conversion${parts > 1 ? ` · part ${part} of ${parts}` : ''}`, prepModel, u)),
+    }))
+    : undefined;
+  // This single, small role-mapping request runs alongside Tamil → Tanglish conversion.
+  const nativeRoles = canUseNativeTurns
+    ? timed('speakers', 'speakers', () => {
+      onProgress('speakers', 'Mapping diarized speakers to rep and customer');
+      return mapNativeSpeakerRoles(key, prepModel, nativeTurns, {
         signal,
-        onProgress: (detail) => onProgress('romanize', detail),
-        onUsage: (u, { part, parts }) => costs.push(chatCostItem('thanglish', `Tanglish conversion${parts > 1 ? ` · part ${part} of ${parts}` : ''}`, prepModel, u)),
-      }),
-    );
+        onUsage: (u) => costs.push(chatCostItem('speakers', 'Speaker role mapping (native diarization)', prepModel, u)),
+      });
+    })
+    : undefined;
+  if (romanization) {
+    onProgress('romanize', 'Converting Tamil words to Tanglish');
+    const converted = await romanization;
     source = converted.text;
     if (converted.words > 0 && converted.byModel === 0) {
       warnings.push('The model could not convert the Tamil words to Tanglish, so the built-in spelling rules were used. Spellings may look slightly different from usual chat Tanglish.');
@@ -297,7 +328,22 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
   const hasTimed = /-->/.test(source);
   let diarizationFailed = 0;
 
-  if (hasSpeakerLabels(turns) || hasTimed) {
+  const mappedNativeRoles = nativeRoles ? await nativeRoles : undefined;
+  if (mappedNativeRoles) {
+    const dictionary = romanization ? (await romanization).dictionary : new Map<string, string>();
+    turns = nativeTurns.map((turn, index) => {
+      const speaker = mappedNativeRoles.get(turn.name) ?? 'unknown';
+      return {
+        id: String(index),
+        speaker,
+        name: speaker === 'rep' ? defaultRep : speaker === 'customer' ? 'Customer' : UNKNOWN_NAME,
+        start: turn.start,
+        end: turn.end,
+        text: applyTanglishDictionary(turn.text, dictionary),
+      };
+    });
+    onProgress('speakers', 'Using native speaker diarization');
+  } else if (hasSpeakerLabels(turns) || hasTimed) {
     onProgress('speakers', 'Using the speaker labels in the transcript');
     timings['speakers'] = 0;
   } else {
@@ -324,7 +370,7 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
       warnings.push(`Speaker labels could not be verified for ${plural(diarizationFailed, 'part')} of the call, so those parts are unlabeled. Talk-ratio and speaker metrics may be incomplete.`);
     }
   }
-  if (!hasTimed) {
+  if (!hasTimed && !mappedNativeRoles) {
     const hasUsableWindows = windows && windows.length > 0 && windows.some((w) => w.end > w.start);
     const usable = hasUsableWindows && windows ? windows : estimateWindows(source, audioDuration);
     turns = retimeTurns(turns, usable);

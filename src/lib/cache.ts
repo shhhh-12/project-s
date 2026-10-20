@@ -37,7 +37,12 @@ export const bytesHash = (value: ArrayBuffer) => digest(value);
 /** Cache key: a fingerprint of the inputs plus everything that would change the answer. */
 const keyFor = (...parts: (string | undefined)[]) => PREFIX + [VERSION, ...parts.map((p) => p ?? '')].join(':');
 
-export type CachedTranscript = { pieces: string[]; seconds: number[] };
+export type CachedTranscript = {
+  pieces: string[];
+  seconds: number[];
+  /** Optional so recordings cached by older app versions remain readable. */
+  nativeSpeakerSegments?: Array<{ text: string; start: number; end: number; speaker: string }>;
+};
 
 export async function getTranscript(audioHash: string, model: string, language?: string) {
   if (!available()) return undefined;

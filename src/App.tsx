@@ -23,6 +23,12 @@ type Tab = 'feedback' | 'transcript' | 'analytics' | 'objections';
 type Context = { repName: string; product: string; vocabulary: string; enquiredAt: string; calledAt: string };
 type ProgressState = { step: StepId; detail?: string };
 
+const TRANSCRIPTION_PRESETS = [
+  { id: 'elevenlabs/scribe-v2', name: 'Scribe v2', detail: 'Best quality · native speaker labels · recommended' },
+  { id: 'microsoft/mai-transcribe-2', name: 'MAI Transcribe 2', detail: 'Lower cost · native speaker labels' },
+  { id: 'microsoft/mai-transcribe-1.5', name: 'MAI Transcribe 1.5', detail: 'Legacy fallback · text only' },
+] as const;
+
 const modelName = 'callscore:models';
 const languageName = 'callscore:language';
 const metricTogglesName = 'callscore:metric-toggles';
@@ -1054,10 +1060,27 @@ function SettingsDrawer({ close, apiKey, setKey, connection, chooseConnection, m
       </button>
       {error && <p className="error" role="alert">{error}</p>}
       {status && <p className="hint">{status}</p>}
+      <h3>Transcription engine</h3>
+      <p className="muted">Choose a ready-to-use model now, or load the full OpenRouter list below. Your choice is saved when you click Save settings.</p>
+      <div className="modelPresets" role="radiogroup" aria-label="Transcription model presets">
+        {TRANSCRIPTION_PRESETS.map((preset) => (
+          <button
+            type="button"
+            role="radio"
+            aria-checked={draft.transcribe === preset.id}
+            className={draft.transcribe === preset.id ? 'active' : ''}
+            key={preset.id}
+            onClick={() => setDraft({ ...draft, transcribe: preset.id })}
+          >
+            <b>{preset.name}</b>
+            <small>{preset.detail}</small>
+          </button>
+        ))}
+      </div>
       <ModelField label="Transcription model (audio → text)" value={draft.transcribe} onChange={(v) => setDraft({ ...draft, transcribe: v })} options={sttModels} placeholder="Load models, then pick one (e.g. a Whisper model)" />
       <ModelField label="Analysis model (scoring and coaching)" value={draft.understand} onChange={(v) => setDraft({ ...draft, understand: v })} options={textModels} placeholder="Load models, then pick one" />
       <ModelField label="Prep model (Thanglish + speakers)" value={draft.prep} onChange={(v) => setDraft({ ...draft, prep: v })} options={textModels} placeholder="Load models, then pick one" />
-      <p className="muted">You can also type a model id directly. The analysis model scores the call; the prep model handles Thanglish conversion and speaker identification.</p>
+      <p className="muted">You can also type a model id directly or select any loaded model. The analysis model scores the call; the prep model handles Thanglish conversion and speaker-role mapping.</p>
 
       <h3>Cache</h3>
       <p className="muted">

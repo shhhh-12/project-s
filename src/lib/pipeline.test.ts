@@ -39,8 +39,9 @@ const sentencesOf = (user: string) =>
 const labels = (speakers: string[]) => ({ labels: speakers.map((speaker, index) => ({ i: index + 1, speaker })) });
 
 function install(handlers: {
-  stt?: (n: number) => string;
+  stt?: (n: number) => unknown;
   diarize?: (sentences: string[], attempt: number) => unknown;
+  roleMap?: () => unknown;
   romanize?: (items: Array<{ ta: string; ctx: string }>, attempt: number) => unknown;
   score: (prompt: string, attempt: number) => unknown;
 }) {
@@ -55,7 +56,8 @@ function install(handlers: {
     const ok = (json: unknown) => new Response(JSON.stringify(json), { status: 200, headers: { 'content-type': 'application/json' } });
     if (path === '/audio/transcriptions') {
       log.push('stt');
-      return ok({ text: handlers.stt!(stt++) });
+      const transcript = handlers.stt!(stt++);
+      return ok(typeof transcript === 'string' ? { text: transcript } : transcript);
     }
     const system = body.messages![0].content;
     const user = body.messages![1].content;
@@ -66,6 +68,10 @@ function install(handlers: {
     if (system.startsWith('You label who is speaking')) {
       log.push('diarize');
       return ok({ choices: [{ message: { content: JSON.stringify(handlers.diarize!(sentencesOf(user), diarizeCalls++)) } }] });
+    }
+    if (system.startsWith('You map anonymous speaker labels')) {
+      log.push('role-map');
+      return ok({ choices: [{ message: { content: JSON.stringify(handlers.roleMap!()) } }] });
     }
     log.push('score');
     return ok({ choices: [{ message: { content: JSON.stringify(handlers.score(user, scoreCalls++)) } }] });
@@ -114,6 +120,27 @@ const fakeAudio = {
 const audioFile = new File([new Uint8Array(4)], 'call.mp3', { type: 'audio/mpeg' });
 
 describe('audio → transcript → speakers → score', () => {
+  it('uses Scribe native diarization plus one role mapping call instead of sentence-by-sentence speaker labelling', async () => {
+    const log = install({
+      stt: (n) => n === 0
+        ? { text: 'Hello sir. I am calling from ABC. Hi, I need a plan.', words: [
+          { word: 'Hello', start: 0, end: 0.2, speaker_label: 'speaker_0' }, { word: 'sir.', start: 0.2, end: 0.4, speaker_label: 'speaker_0' },
+          { word: 'I', start: 0.5, end: 0.6, speaker_label: 'speaker_0' }, { word: 'am', start: 0.6, end: 0.7, speaker_label: 'speaker_0' }, { word: 'calling', start: 0.7, end: 0.9, speaker_label: 'speaker_0' }, { word: 'from', start: 0.9, end: 1.1, speaker_label: 'speaker_0' }, { word: 'ABC.', start: 1.1, end: 1.3, speaker_label: 'speaker_0' },
+          { word: 'Hi,', start: 1.4, end: 1.5, speaker_label: 'speaker_1' }, { word: 'I', start: 1.5, end: 1.6, speaker_label: 'speaker_1' }, { word: 'need', start: 1.6, end: 1.8, speaker_label: 'speaker_1' }, { word: 'a', start: 1.8, end: 1.9, speaker_label: 'speaker_1' }, { word: 'plan.', start: 1.9, end: 2.1, speaker_label: 'speaker_1' },
+        ] }
+        : { text: 'What is the price? It is 999.', words: [
+          { word: 'What', start: 0, end: 0.2, speaker_label: 'speaker_1' }, { word: 'is', start: 0.2, end: 0.3, speaker_label: 'speaker_1' }, { word: 'the', start: 0.3, end: 0.4, speaker_label: 'speaker_1' }, { word: 'price?', start: 0.4, end: 0.6, speaker_label: 'speaker_1' },
+          { word: 'It', start: 0.7, end: 0.8, speaker_label: 'speaker_0' }, { word: 'is', start: 0.8, end: 0.9, speaker_label: 'speaker_0' }, { word: '999.', start: 0.9, end: 1.1, speaker_label: 'speaker_0' },
+        ] },
+      roleMap: () => ({ roles: [{ label: 'speaker_0', speaker: 'rep' }, { label: 'speaker_1', speaker: 'customer' }] }),
+      score: () => report(criterionIds.map((id) => criterion(id, null))),
+    });
+    const result = await runAnalysis({ key: 'k', models: { ...models, transcribe: 'elevenlabs/scribe-v2' }, text: '', audio: audioFile, onProgress: quiet, deps: fakeAudio });
+    expect(log).toEqual(['stt', 'stt', 'role-map', 'score']);
+    expect(result.transcript.map((turn) => turn.speaker)).toEqual(['rep', 'customer', 'rep']);
+    expect(result.transcript.map((turn) => turn.start)).toEqual([0, 1.4, 60.7]);
+  });
+
   it('runs the whole audio flow and produces a validated analysis', async () => {
     const log = install({
       stt: (n) => [chunk1, chunk2][n],

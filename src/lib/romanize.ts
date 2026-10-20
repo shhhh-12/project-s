@@ -167,6 +167,7 @@ Rules:
 Return ONLY JSON: {"words":[{"ta":"...","en":"..."}]}`;
 
 const BATCH = 120;
+const BATCH_CONCURRENCY = 3;
 const CONTEXT_WORDS = 3;
 const SAFE_SPELLING = /^[a-z][a-z'-]*$/;
 
@@ -197,7 +198,13 @@ export type RomanizeResult = {
   byModel: number;
   /** Distinct words converted by the built-in rules because the model skipped or mangled them. */
   byRules: number;
+  /** Reused by speaker-labelled turns so their text stays identical to the final transcript. */
+  dictionary: ReadonlyMap<string, string>;
 };
+
+/** Applies a completed conversion dictionary without another model call. */
+export const applyTanglishDictionary = (text: string, dictionary: ReadonlyMap<string, string>) =>
+  text.replace(TAMIL_RUN, (run) => dictionary.get(stripJoiners(run)) ?? transliterateTamil(run));
 
 /**
  * Converts every Tamil-script word in `text` to Tanglish. Guarantees that no Tamil script remains and that every
@@ -210,16 +217,19 @@ export async function romanizeTamilText(
   options: { signal?: AbortSignal; onProgress?: (detail: string) => void; onUsage?: (usage: Usage, info: { part: number; parts: number }) => void } = {},
 ): Promise<RomanizeResult> {
   const words = collectWords(text);
-  if (!words.size) return { text, words: 0, byModel: 0, byRules: 0 };
+  if (!words.size) return { text, words: 0, byModel: 0, byRules: 0, dictionary: new Map() };
 
   const entries = [...words.entries()];
   const batches: Array<Array<[string, string]>> = [];
   for (let i = 0; i < entries.length; i += BATCH) batches.push(entries.slice(i, i + BATCH));
 
   const dictionary = new Map<string, string>();
-  for (let index = 0; index < batches.length; index++) {
+  // Each batch is a dictionary lookup with its own local context, so batches are independent.
+  // Running a few together removes long serial waits on a 30-minute recording without changing spelling quality.
+  let nextBatch = 0;
+  const convertBatch = async (batch: Array<[string, string]>, index: number) => {
     options.onProgress?.(batches.length > 1 ? `Converting Tamil words · part ${index + 1} of ${batches.length}` : `Converting ${entries.length} Tamil words`);
-    const user = JSON.stringify(batches[index].map(([ta, ctx]) => ({ ta, ctx })));
+    const user = JSON.stringify(batch.map(([ta, ctx]) => ({ ta, ctx })));
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const { data, usage } = await chatJson(key, model, system, user, wordSchema, options.signal);
@@ -235,9 +245,15 @@ export async function romanizeTamilText(
         if (!(error instanceof RouterError && error.status === 502)) throw error;
       }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(BATCH_CONCURRENCY, batches.length) }, async () => {
+    while (nextBatch < batches.length) {
+      const index = nextBatch++;
+      await convertBatch(batches[index], index);
+    }
+  }));
 
-  const converted = text.replace(TAMIL_RUN, (run) => dictionary.get(stripJoiners(run)) ?? transliterateTamil(run));
+  const converted = applyTanglishDictionary(text, dictionary);
   const byModel = [...words.keys()].filter((w) => dictionary.has(w)).length;
-  return { text: converted, words: words.size, byModel, byRules: words.size - byModel };
+  return { text: converted, words: words.size, byModel, byRules: words.size - byModel, dictionary };
 }

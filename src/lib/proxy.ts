@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { RouterModel } from '../config/models';
 import { getSession, getSupabase, isSupabaseConfigured } from './supabase';
-import { RouterError, chatBody, extractJson, looksTruncated, type TranscribeUsage, type Usage, withChatFallbacks } from './openrouter';
+import { RouterError, chatBody, extractJson, looksTruncated, nativeSegments, type TranscribeOptions, type Usage, withChatFallbacks } from './openrouter';
+import { supportsNativeDiarization } from '../config/models';
 
 /** The server transport is available only to an authenticated Supabase user. */
 export async function hasSession(): Promise<boolean> {
@@ -56,9 +57,20 @@ export async function proxyChatJson<T>(_key: string, model: string, system: stri
   return { data: checked.data, usage: result.data.usage };
 }
 
-export async function proxyTranscribe(_key: string, model: string, audio: { data: string; format: string }, options: { language?: string; signal?: AbortSignal; onUsage?: (usage: TranscribeUsage) => void } = {}): Promise<string> {
-  const result = await invoke<{ text?: unknown; usage?: { cost?: unknown } }>({ model, input_audio: audio, ...(options.language ? { language: options.language } : {}) }, options.signal);
+export async function proxyTranscribe(_key: string, model: string, audio: { data: string; format: string }, options: TranscribeOptions = {}): Promise<string> {
+  const nativeDiarization = Boolean(options.diarize && supportsNativeDiarization(model));
+  const result = await invoke<{ text?: unknown; usage?: { cost?: unknown }; segments?: unknown }>({
+    model,
+    input_audio: audio,
+    ...(options.language ? { language: options.language } : {}),
+    ...(nativeDiarization && model === 'microsoft/mai-transcribe-2'
+      ? { response_format: 'verbose_json', timestamp_granularities: ['word'], provider: { options: { azure: { diarization: { enabled: true } } } } }
+      : nativeDiarization
+        ? { response_format: 'verbose_json', timestamp_granularities: ['word'], provider: { options: { elevenlabs: { diarize: true, num_speakers: 2, tag_audio_events: false } } } }
+        : {}),
+  }, options.signal);
   if (typeof result.text !== 'string') throw new RouterError(502, 'The transcription model returned no text.');
+  if (nativeDiarization) options.onSegments?.(nativeSegments(model, result));
   options.onUsage?.({ cost: typeof result.usage?.cost === 'number' ? result.usage.cost : null });
   return result.text;
 }
