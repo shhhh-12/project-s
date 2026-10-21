@@ -121,6 +121,7 @@ const audioFile = new File([new Uint8Array(4)], 'call.mp3', { type: 'audio/mpeg'
 
 describe('audio → transcript → speakers → score', () => {
   it('uses Scribe native diarization plus one role mapping call instead of sentence-by-sentence speaker labelling', async () => {
+    let prepareOptions: { preserveOriginal?: boolean } | undefined;
     const log = install({
       stt: (n) => n === 0
         ? { text: 'Hello sir. I am calling from ABC. Hi, I need a plan.', words: [
@@ -135,10 +136,43 @@ describe('audio → transcript → speakers → score', () => {
       roleMap: () => ({ roles: [{ label: 'speaker_0', speaker: 'rep' }, { label: 'speaker_1', speaker: 'customer' }] }),
       score: () => report(criterionIds.map((id) => criterion(id, null))),
     });
-    const result = await runAnalysis({ key: 'k', models: { ...models, transcribe: 'elevenlabs/scribe-v2' }, text: '', audio: audioFile, onProgress: quiet, deps: fakeAudio });
+    const result = await runAnalysis({
+      key: 'k',
+      models: { ...models, transcribe: 'elevenlabs/scribe-v2' },
+      text: '',
+      audio: audioFile,
+      onProgress: quiet,
+      deps: { prepareAudio: async (_file, _signal, options) => {
+        prepareOptions = options;
+        return fakeAudio.prepareAudio();
+      } },
+    });
     expect(log).toEqual(['stt', 'stt', 'role-map', 'score']);
+    expect(prepareOptions).toEqual({ preserveOriginal: true });
     expect(result.transcript.map((turn) => turn.speaker)).toEqual(['rep', 'customer', 'rep']);
     expect(result.transcript.map((turn) => turn.start)).toEqual([0, 1.4, 60.7]);
+  });
+
+  it('uses Fish inline speaker markers as native turns, then maps each voice once', async () => {
+    const log = install({
+      stt: (n) => n === 0
+        ? '<|speaker:0|> Vanakkam, ABC Internet la irundhu pesuren. <|speaker:1|> Plan price enna?'
+        : '<|speaker:1|> Cost konjam high. <|speaker:0|> Monthly 999 rupees.',
+      roleMap: () => ({ roles: [{ label: 'speaker_0', speaker: 'rep' }, { label: 'speaker_1', speaker: 'customer' }] }),
+      score: () => report(criterionIds.map((id) => criterion(id, null))),
+    });
+    const result = await runAnalysis({
+      key: 'k',
+      models: { ...models, transcribe: 'fish-audio/transcribe-1-pro' },
+      text: '',
+      audio: audioFile,
+      onProgress: quiet,
+      deps: fakeAudio,
+    });
+    expect(log).toEqual(['stt', 'stt', 'role-map', 'score']);
+    // The customer's adjacent turns at the chunk boundary are intentionally merged.
+    expect(result.transcript.map((turn) => turn.speaker)).toEqual(['rep', 'customer', 'rep']);
+    expect(result.transcript.map((turn) => turn.text).join(' ')).not.toContain('<|speaker:');
   });
 
   it('runs the whole audio flow and produces a validated analysis', async () => {

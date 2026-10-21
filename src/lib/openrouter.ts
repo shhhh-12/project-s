@@ -278,6 +278,25 @@ export type TranscribeOptions = {
   onSegments?: (segments: TranscriptSegment[]) => void;
 };
 
+const FISH_SPEAKER = /<\|speaker:(\d+)\|>/gi;
+
+/** Fish returns speaker markers in plain text. Remove only those control markers, never spoken words. */
+export const stripFishSpeakerMarkers = (text: string) => text.replace(FISH_SPEAKER, '').replace(/\s{2,}/g, ' ').trim();
+
+/** Converts Fish inline speaker markers into turns. Times are proportional estimates when Fish did not return segments. */
+export function fishSpeakerSegments(text: string): TranscriptSegment[] {
+  const matches = [...text.matchAll(FISH_SPEAKER)];
+  if (!matches.length) return [];
+  const labelled = matches.flatMap((match, index) => {
+    const from = (match.index ?? 0) + match[0].length;
+    const to = index + 1 < matches.length ? (matches[index + 1].index ?? text.length) : text.length;
+    const spoken = text.slice(from, to).replace(/\s+/g, ' ').trim();
+    return spoken ? [{ text: spoken, speaker: `speaker_${match[1]}`, from, to }] : [];
+  });
+  const textLength = Math.max(1, text.length);
+  return labelled.map((turn) => ({ text: turn.text, speaker: turn.speaker, start: turn.from / textLength, end: turn.to / textLength }));
+}
+
 /** Converts provider-specific verbose transcription output into stable speaker-labelled turns. */
 export function nativeSegments(model: string, value: unknown): TranscriptSegment[] {
   if (!value || typeof value !== 'object') return [];
@@ -334,7 +353,7 @@ export async function transcribe(
           timestamp_granularities: ['word'],
           provider: { options: { azure: { diarization: { enabled: true } } } },
         }
-      : nativeDiarization
+      : nativeDiarization && model === 'elevenlabs/scribe-v2'
         ? {
             response_format: 'verbose_json',
             timestamp_granularities: ['word'],

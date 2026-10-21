@@ -18,6 +18,14 @@ const cors = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
+/** Allows diagnostics to correlate one request without logging call content, auth tokens or user IDs. */
+const traceOf = (value: unknown) => typeof value === 'string' && /^[a-zA-Z0-9-]{8,80}$/.test(value) ? value : crypto.randomUUID();
+const routeOf = (body: Record<string, unknown>) => body.listModels === true ? 'models' : 'input_audio' in body ? 'transcription' : 'chat';
+const audioBytesOf = (body: Record<string, unknown>) => {
+  const data = (body.input_audio as { data?: unknown } | undefined)?.data;
+  return typeof data === 'string' ? Math.floor((data.length * 3) / 4) : 0;
+};
+
 /** Verifies the caller's JWT and returns their user id, or null when invalid. */
 async function authenticate(req: Request): Promise<string | null> {
   const header = req.headers.get('Authorization');
@@ -54,15 +62,30 @@ Deno.serve(async (req) => {
     });
   }
 
-  let body: Record<string, unknown>;
+  let requestBody: Record<string, unknown>;
   try {
-    body = await req.json();
+    requestBody = await req.json();
   } catch {
     return new Response(JSON.stringify({ error: { message: 'Invalid JSON body.' } }), {
       status: 400,
       headers: { ...cors, 'Content-Type': 'application/json' },
     });
   }
+  const traceId = traceOf(requestBody.trace_id);
+  const body = Object.fromEntries(Object.entries(requestBody).filter(([key]) => key !== 'trace_id'));
+  const route = routeOf(body);
+  const model = typeof body.model === 'string' ? body.model.slice(0, 160) : undefined;
+  const started = performance.now();
+  const log = (event: 'completed' | 'failed', status: number) => console.log(JSON.stringify({
+    event: 'openrouter_proxy',
+    outcome: event,
+    trace_id: traceId,
+    route,
+    ...(model ? { model } : {}),
+    ...(route === 'transcription' ? { audio_bytes: audioBytesOf(body) } : {}),
+    status,
+    elapsed_ms: Math.round(performance.now() - started),
+  }));
 
   const upstreamHeaders: Record<string, string> = {
     Authorization: `Bearer ${key}`,
@@ -82,6 +105,7 @@ Deno.serve(async (req) => {
         : `${OPENROUTER_URL}/models`;
       payload = '{}';
     } else if (typeof body.model !== 'string' || !body.model) {
+      log('failed', 400);
       return new Response(JSON.stringify({ error: { message: 'Missing model.' } }), {
         status: 400,
         headers: { ...cors, 'Content-Type': 'application/json' },
@@ -101,8 +125,11 @@ Deno.serve(async (req) => {
     const generationId = upstream.headers.get('x-generation-id');
     if (generationId) headers['x-generation-id'] = generationId;
     if (!upstream.ok) headers['x-openrouter-status'] = String(upstream.status);
+    headers['x-callscore-trace-id'] = traceId;
+    log(upstream.ok ? 'completed' : 'failed', upstream.status);
     return new Response(text, { status: upstream.status, headers });
   } catch (error) {
+    log('failed', 502);
     return new Response(JSON.stringify({ error: { message: `Could not reach OpenRouter: ${error.message}` } }), {
       status: 502,
       headers: { ...cors, 'Content-Type': 'application/json' },

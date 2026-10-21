@@ -66,11 +66,22 @@ export function toBase64(bytes: Uint8Array) {
   return btoa(binary);
 }
 
+const FILE_READ_TIMEOUT_MS = 30_000;
+
 function blobToBase64(blob: Blob) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
-    reader.onerror = () => reject(new Error('Could not read this audio file.'));
-    reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '');
+    const timer = window.setTimeout(() => {
+      reader.abort();
+      reject(new Error('Reading the audio file took too long. Export it as an MP3 under 25 MB and try again.'));
+    }, FILE_READ_TIMEOUT_MS);
+    const done = (fn: () => void) => {
+      window.clearTimeout(timer);
+      fn();
+    };
+    reader.onerror = () => done(() => reject(new Error('Could not read this audio file.')));
+    reader.onabort = () => done(() => reject(new Error('Reading the audio file was cancelled.')));
+    reader.onload = () => done(() => resolve(String(reader.result).split(',')[1] ?? ''));
     reader.readAsDataURL(blob);
   });
 }
@@ -111,7 +122,17 @@ async function decodeToMono16k(file: Blob) {
 
 const aborted = () => new DOMException('The analysis was cancelled.', 'AbortError');
 
-export async function prepareAudio(file: File, signal?: AbortSignal): Promise<PreparedAudio> {
+export type PrepareAudioOptions = { preserveOriginal?: boolean };
+
+export async function prepareAudio(file: File, signal?: AbortSignal, options: PrepareAudioOptions = {}): Promise<PreparedAudio> {
+  // Scribe v2 accepts all formats we allow in the uploader. Keeping the original avoids decoding the
+  // entire recording, rendering a large PCM buffer, and re-encoding dozens of one-minute WAV files.
+  if (options.preserveOriginal) {
+    if (signal?.aborted) throw aborted();
+    const [duration, data] = await Promise.all([mediaDuration(file), blobToBase64(file)]);
+    if (signal?.aborted) throw aborted();
+    return { chunks: [{ data, format: audioFormat(file), start: 0, end: duration }], duration, converted: false };
+  }
   try {
     const { samples, duration } = await decodeToMono16k(file);
     const chunks: AudioChunk[] = [];

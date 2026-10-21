@@ -15,12 +15,15 @@ export async function hasSession(): Promise<boolean> {
 }
 
 async function invoke<T>(body: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
-  const { data, error } = await getSupabase().functions.invoke('openrouter-proxy', { body, signal });
+  // This identifier is diagnostic-only. It lets a developer find one request in Edge Function logs
+  // without sending a call recording, transcript, API key, or user identifier to the log stream.
+  const traceId = globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const { data, error } = await getSupabase().functions.invoke('openrouter-proxy', { body: { ...body, trace_id: traceId }, signal });
   if (error) {
     const context = (error as { context?: Response }).context;
     const status = context?.status ?? 502;
     const payload = (await context?.json().catch(() => undefined)) as { error?: { message?: string } } | undefined;
-    throw new RouterError(status, payload?.error?.message ?? 'The team analysis service could not complete the request.');
+    throw new RouterError(status, `${payload?.error?.message ?? 'The team analysis service could not complete the request.'} (trace: ${traceId})`);
   }
   return data as T;
 }
@@ -65,7 +68,7 @@ export async function proxyTranscribe(_key: string, model: string, audio: { data
     ...(options.language ? { language: options.language } : {}),
     ...(nativeDiarization && model === 'microsoft/mai-transcribe-2'
       ? { response_format: 'verbose_json', timestamp_granularities: ['word'], provider: { options: { azure: { diarization: { enabled: true } } } } }
-      : nativeDiarization
+      : nativeDiarization && model === 'elevenlabs/scribe-v2'
         ? { response_format: 'verbose_json', timestamp_granularities: ['word'], provider: { options: { elevenlabs: { diarize: true, num_speakers: 2, tag_audio_events: false } } } }
         : {}),
   }, options.signal);

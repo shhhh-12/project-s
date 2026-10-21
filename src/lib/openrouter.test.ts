@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { chatJson, DEFAULT_MAX_TOKENS, extractJson, listModels, nativeSegments, RouterError, transcribe, validateKey } from './openrouter';
+import { chatJson, DEFAULT_MAX_TOKENS, extractJson, fishSpeakerSegments, listModels, nativeSegments, RouterError, stripFishSpeakerMarkers, transcribe, validateKey } from './openrouter';
 
 const original = globalThis.fetch;
 afterEach(() => {
@@ -70,6 +70,17 @@ describe('openrouter client', () => {
       { text: 'Apadi thana?', start: 0, end: 0.5, speaker: '0' },
       { text: 'Yes.', start: 0.6, end: 0.9, speaker: '1' },
     ]);
+  });
+  it('reads Fish inline speaker markers without retaining control text in the transcript', async () => {
+    const calls = mock(() => ({ json: { text: '<|speaker:0|> Vanakkam sir. <|speaker:1|> Plan price enna?' } }));
+    expect(await transcribe('k', 'fish-audio/transcribe-1-pro', { data: 'AAA', format: 'wav' }, { diarize: true })).toContain('<|speaker:0|>');
+    expect(calls[0].body?.provider).toBeUndefined();
+    expect(stripFishSpeakerMarkers('<|speaker:0|> Vanakkam <|speaker:1|> Hi')).toBe('Vanakkam Hi');
+    expect(fishSpeakerSegments('<|speaker:0|> Vanakkam sir. <|speaker:1|> Plan price enna?')).toMatchObject([
+      { speaker: 'speaker_0', text: 'Vanakkam sir.' },
+      { speaker: 'speaker_1', text: 'Plan price enna?' },
+    ]);
+    expect(fishSpeakerSegments('<|speaker:0|> One uninterrupted turn.')).toMatchObject([{ speaker: 'speaker_0', text: 'One uninterrupted turn.' }]);
   });
   it('extracts JSON from fenced or chatty answers', () => {
     expect(extractJson('```json\n{"a":1}\n```')).toEqual({ a: 1 });

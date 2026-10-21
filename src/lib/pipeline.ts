@@ -1,13 +1,13 @@
 import { z } from 'zod';
 import { AnalysisSchema, SEVERITIES, criterionIds, type Analysis, type CostItem, type Criterion, type CriterionId } from '../domain';
 import { RUBRIC } from '../config/rubric';
-import { supportsNativeDiarization, type ModelSlots } from '../config/models';
+import { supportsNativeDiarization, supportsOriginalAudio, type ModelSlots } from '../config/models';
 import { systemPrompt, PROMPT_VERSION } from '../prompts/analysis';
 import { prepareAudio, type PreparedAudio } from './audio';
 import { chatCostItem, transcribeCostItem } from './cost';
 import { scoreCall } from './scoring';
 import { diarize, mapNativeSpeakerRoles, speakerOf } from './diarize';
-import { chatJson, transcribe, type TranscriptSegment, type TranscribeUsage } from './openrouter';
+import { chatJson, fishSpeakerSegments, stripFishSpeakerMarkers, transcribe, type TranscriptSegment, type TranscribeUsage } from './openrouter';
 import { applyTanglishDictionary, hasTamilScript, romanizeTamilText } from './romanize';
 import { computeAllMetrics } from './metrics';
 import { turnForTimestamp } from './mistakes';
@@ -168,7 +168,7 @@ export type RunOptions = {
   signal?: AbortSignal;
   onProgress: Progress;
   /** Test seam: replaces browser audio decoding. */
-  deps?: { prepareAudio?: (file: File, signal?: AbortSignal) => Promise<PreparedAudio> };
+  deps?: { prepareAudio?: (file: File, signal?: AbortSignal, options?: { preserveOriginal?: boolean }) => Promise<PreparedAudio> };
 };
 
 /** Build the same criteria shape the validator produces, but without quote verification — used to total each scoring run. */
@@ -210,9 +210,9 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
   const costs: CostItem[] = [];
   const speechCalls: Array<{ label: string; seconds: number; usage: TranscribeUsage }> = [];
   const timings: Record<string, number> = {};
-  const timed = <T>(step: StepId, label: string, fn: () => Promise<T>): Promise<T> => {
+  const timed = <T>(step: StepId, label: string, fn: () => Promise<T>, detail?: string): Promise<T> => {
     const start = performance.now();
-    onProgress(step);
+    onProgress(step, detail);
     return fn().finally(() => { timings[label] = Math.round(performance.now() - start); });
   };
 
@@ -245,8 +245,17 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
       timings['prepare'] = 0;
       timings['transcribe'] = 0;
     } else {
-      const prepared = await timed('prepare', 'prepare', () => (deps?.prepareAudio ?? prepareAudio)(audio, signal));
+      const preserveOriginal = supportsOriginalAudio(models.transcribe);
+      const prepared = await timed(
+        'prepare',
+        'prepare',
+        () => (deps?.prepareAudio ?? prepareAudio)(audio, signal, { preserveOriginal }),
+        preserveOriginal ? 'Using the original audio for Scribe v2' : undefined,
+      );
       audioDuration = prepared.duration;
+      if (preserveOriginal && audioDuration >= 25 * 60) {
+        warnings.push('This long recording is being sent directly to Scribe v2 to avoid a slow browser re-encode. Keep the tab open until transcription finishes.');
+      }
 
       // Transcribe chunks in parallel. Native diarization eliminates the much slower sentence-by-sentence pass later.
       const transcribeStarted = performance.now();
@@ -256,14 +265,26 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
         const partLabel = prepared.chunks.length > 1 ? `part ${i + 1} of ${prepared.chunks.length}` : 'full call';
         const usage: TranscribeUsage = {};
         let segments: TranscriptSegment[] = [];
-        const piece = (await transcribe(key, models.transcribe, chunk, {
+        const rawPiece = await transcribe(key, models.transcribe, chunk, {
           language,
           signal,
           diarize: useNativeDiarization,
           onUsage: (u) => Object.assign(usage, u),
           onSegments: (items) => { segments = items.map((item) => ({ ...item, start: item.start + chunk.start, end: item.end + chunk.start })); },
-        })).trim();
+        });
         const span = chunk.end > chunk.start ? chunk.end - chunk.start : prepared.duration;
+        if (!segments.length && models.transcribe === 'fish-audio/transcribe-1-pro') {
+          segments = fishSpeakerSegments(rawPiece).map((item) => ({
+            ...item,
+            start: chunk.start + item.start * span,
+            end: chunk.start + item.end * span,
+          }));
+        }
+        const piece = (models.transcribe === 'fish-audio/transcribe-1-pro' ? stripFishSpeakerMarkers(rawPiece) : rawPiece).trim();
+        // Never omit a section of the call merely because Fish missed a marker in that chunk.
+        if (!segments.length && models.transcribe === 'fish-audio/transcribe-1-pro' && piece) {
+          segments = [{ text: piece, speaker: 'unknown', start: chunk.start, end: chunk.end }];
+        }
         return { chunk, partLabel, piece, span, usage, segments };
       });
       const nonEmpty = transcribed.filter(({ piece }) => Boolean(piece));
@@ -295,7 +316,8 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
     } else out.push({ name: segment.speaker, text: segment.text, start: segment.start, end: segment.end });
     return out;
   }, []);
-  const canUseNativeTurns = nativeTurns.length > 0 && new Set(nativeTurns.map((turn) => turn.name)).size > 1;
+  const nativeSpeakerNames = new Set(nativeTurns.filter((turn) => turn.name !== 'unknown').map((turn) => turn.name));
+  const canUseNativeTurns = nativeTurns.length > 0 && nativeSpeakerNames.size > 1;
   const romanization = hasTamilScript(source)
     ? timed('romanize', 'romanize', () => romanizeTamilText(key, prepModel, source, {
       signal,
@@ -307,7 +329,7 @@ export async function runAnalysis({ key, models, text: pasted, audio, context, l
   const nativeRoles = canUseNativeTurns
     ? timed('speakers', 'speakers', () => {
       onProgress('speakers', 'Mapping diarized speakers to rep and customer');
-      return mapNativeSpeakerRoles(key, prepModel, nativeTurns, {
+      return mapNativeSpeakerRoles(key, prepModel, nativeTurns.filter((turn) => turn.name !== 'unknown'), {
         signal,
         onUsage: (u) => costs.push(chatCostItem('speakers', 'Speaker role mapping (native diarization)', prepModel, u)),
       });

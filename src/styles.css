@@ -128,3 +128,7 @@ mark.hl-evidence{background:#12e8e020;text-decoration:none;box-shadow:inset 0 -2
 .seg.compact{margin:12px 0 4px}
 .modelPresets{display:grid;gap:8px;margin:12px 0 4px}.modelPresets button{display:grid;gap:3px;text-align:left;border:1px solid #34414c;background:#101419;color:#edf5f6;border-radius:8px;padding:12px 13px}.modelPresets button:hover{border-color:#12e8e0;background:#111d21}.modelPresets button.active{border-color:#12e8e0;background:#082529;box-shadow:inset 3px 0 #12e8e0}.modelPresets small{color:#98a4b3;font-weight:500}.modelPresets button.active small{color:#b7c2cb}
 .privacy .text{display:inline;margin:0;padding:0 2px;background:none;border:0;color:#12e8e0;text-decoration:underline;cursor:pointer;font:inherit}
+
+/* A reversible correction for an otherwise good transcript with the two roles flipped. */
+.speakerCorrection{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:14px 0 6px;padding:12px;border:1px solid #725d2d;background:#211c10;color:#e9d495;border-radius:8px;font-size:13px}.speakerCorrection .secondary{flex:0 0 auto;padding:8px 10px;font-size:12px}
+@media (max-width:767px){.speakerCorrection{align-items:flex-start;flex-direction:column}.speakerCorrection .secondary{width:100%}}

@@ -25,6 +25,7 @@ type ProgressState = { step: StepId; detail?: string };
 
 const TRANSCRIPTION_PRESETS = [
   { id: 'elevenlabs/scribe-v2', name: 'Scribe v2', detail: 'Best quality · native speaker labels · recommended' },
+  { id: 'fish-audio/transcribe-1-pro', name: 'Fish Transcribe 1 Pro', detail: 'Conversation-focused · native speaker labels · experimental' },
   { id: 'microsoft/mai-transcribe-2', name: 'MAI Transcribe 2', detail: 'Lower cost · native speaker labels' },
   { id: 'microsoft/mai-transcribe-1.5', name: 'MAI Transcribe 1.5', detail: 'Legacy fallback · text only' },
 ] as const;
@@ -62,6 +63,25 @@ function describeError(error: unknown) {
   if (error instanceof Error) return error.message;
   return 'Analysis failed.';
 }
+
+const srtClock = (seconds: number) => {
+  const milliseconds = Math.max(0, Math.round(seconds * 1000));
+  const hours = Math.floor(milliseconds / 3_600_000);
+  const minutes = Math.floor((milliseconds % 3_600_000) / 60_000);
+  const wholeSeconds = Math.floor((milliseconds % 60_000) / 1000);
+  const remainder = milliseconds % 1000;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(wholeSeconds).padStart(2, '0')},${String(remainder).padStart(3, '0')}`;
+};
+
+/** Re-score the existing words with the two semantic roles reversed; no audio is uploaded or transcribed again. */
+const transcriptWithSwappedRoles = (analysis: Analysis) =>
+  analysis.transcript
+    .map((turn, index) => {
+      const label = turn.speaker === 'rep' ? 'Customer' : turn.speaker === 'customer' ? 'Rep' : turn.name;
+      const end = Math.max(turn.end, turn.start + 0.1);
+      return `${index + 1}\n${srtClock(turn.start)} --> ${srtClock(end)}\n${label}: ${turn.text}`;
+    })
+    .join('\n\n');
 
 function useEscape(close: () => void) {
   useEffect(() => {
@@ -239,6 +259,42 @@ export function App() {
     await deleteAnalysis(id).catch(() => undefined);
     setHistory((items) => items.filter((item) => item.id !== id));
   };
+  const rescoreWithSwappedSpeakers = async () => {
+    if (!analysis) return;
+    const original = analysis;
+    const controller = new AbortController();
+    setAbort(controller);
+    setError('');
+    setProgress(null);
+    setSteps(stepsFor(false));
+    setStage('working');
+    try {
+      const value = await runAnalysis({
+        key,
+        models,
+        text: transcriptWithSwappedRoles(original),
+        context,
+        language,
+        doubleScore,
+        signal: controller.signal,
+        onProgress: (step, detail) => setProgress({ step, detail }),
+      });
+      value.warnings.unshift('Speaker roles were manually swapped and the scorecard was regenerated. The recording was not transcribed again.');
+      await saveAnalysis(value).catch(() => undefined);
+      const savedAudio = await loadAudio(original.id).catch(() => undefined);
+      if (savedAudio) await saveAudio(value.id, savedAudio).catch(() => undefined);
+      setAnalysis(value);
+      setHistory((items) => [value, ...items]);
+      setTab('feedback');
+      setStage('result');
+    } catch (e) {
+      setError(describeError(e));
+      setAnalysis(original);
+      setStage('result');
+    } finally {
+      setAbort(undefined);
+    }
+  };
 
   return (
     <>
@@ -282,6 +338,8 @@ export function App() {
             setStage('input');
           }}
           metricToggles={metricToggles}
+          rescoreWithSwappedSpeakers={rescoreWithSwappedSpeakers}
+          error={error}
         />
       )}
       {settingsDrawer}
@@ -537,7 +595,7 @@ function Processing({ steps, progress, cancel }: { steps: StepId[]; progress: Pr
   );
 }
 
-function Results({ analysis, tab, setTab, reset, metricToggles }: { analysis: Analysis; tab: Tab; setTab: (x: Tab) => void; reset: () => void; metricToggles: Record<MetricName, boolean> }) {
+function Results({ analysis, tab, setTab, reset, metricToggles, rescoreWithSwappedSpeakers, error }: { analysis: Analysis; tab: Tab; setTab: (x: Tab) => void; reset: () => void; metricToggles: Record<MetricName, boolean>; rescoreWithSwappedSpeakers: () => void; error: string }) {
   const score = useMemo(() => getScore(analysis), [analysis]);
   return (
     <main className="shell results">
@@ -568,6 +626,7 @@ function Results({ analysis, tab, setTab, reset, metricToggles }: { analysis: An
         </div>
       </section>
       <div className="content">
+        {error && <p className="error" role="alert">{error}</p>}
         <nav className="tabs" aria-label="Call results">
           {(['feedback', 'transcript', 'analytics', 'objections'] as Tab[]).map((x) => (
             <button className={tab === x ? 'active' : ''} onClick={() => setTab(x)} key={x}>
@@ -576,7 +635,7 @@ function Results({ analysis, tab, setTab, reset, metricToggles }: { analysis: An
           ))}
         </nav>
         {tab === 'feedback' && <Feedback analysis={analysis} score={score} />}
-        {tab === 'transcript' && <Transcript analysis={analysis} key={analysis.id} />}
+        {tab === 'transcript' && <Transcript analysis={analysis} key={analysis.id} rescoreWithSwappedSpeakers={rescoreWithSwappedSpeakers} />}
         {tab === 'analytics' && <Analytics analysis={analysis} toggles={metricToggles} />}
         {tab === 'objections' && <Objections analysis={analysis} />}
       </div>
@@ -694,7 +753,7 @@ function Feedback({ analysis, score }: { analysis: Analysis; score: ScoreResult 
   );
 }
 
-function Transcript({ analysis }: { analysis: Analysis }) {
+function Transcript({ analysis, rescoreWithSwappedSpeakers }: { analysis: Analysis; rescoreWithSwappedSpeakers: () => void }) {
   const [q, setQ] = useState('');
   const [src, setSrc] = useState<string>();
   const [showMistakes, setShowMistakes] = useState(true);
@@ -797,6 +856,12 @@ function Transcript({ analysis }: { analysis: Analysis }) {
           <h2>Transcript</h2>
           <input className="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search transcript" aria-label="Search transcript" />
         </div>
+        {analysis.transcript.some((turn) => turn.speaker === 'rep') && analysis.transcript.some((turn) => turn.speaker === 'customer') && (
+          <div className="speakerCorrection">
+            <span>Are the Rep and Customer labels reversed?</span>
+            <button className="secondary" onClick={rescoreWithSwappedSpeakers}>Swap roles and re-score</button>
+          </div>
+        )}
         {shown.map((t) => {
           const marks = byTurn.get(t.id) ?? [];
           const worst = marks.find((m) => m.kind === 'mistake');
